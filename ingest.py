@@ -16,9 +16,7 @@ import zstandard
 
 DEFAULT_DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/analysis"
 DEFAULT_BATCH_SIZE = 1000
-FAST_BATCH_SIZE = 50_000
 DEFAULT_GZIP_LEVEL = 6
-FAST_GZIP_LEVEL = 1
 SYNCHRONOUS_COMMIT_VALUES = {"on", "off", "local", "remote_write", "remote_apply"}
 
 
@@ -79,36 +77,25 @@ class ProgressReporter:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Stream .zst-compressed JSONL analysis records into a lean Postgres lookup table."
+        description="Stream .jsonl.zst analysis records into a lean Postgres lookup table."
     )
-    parser.add_argument("input_path", help="Directory containing .zst files to ingest.")
+    parser.add_argument("input_path", help="Directory containing .jsonl.zst files to ingest.")
     parser.add_argument(
         "--database-url",
         default=os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL),
         help="Postgres connection URL. Defaults to DATABASE_URL or local Docker Compose Postgres.",
     )
     parser.add_argument(
-        "--fast",
-        action="store_true",
-        help=(
-            "Use aggressive ingest defaults: all CPU workers, batch size 50000, "
-            "gzip level 1, and synchronous_commit=off."
-        ),
-    )
-    parser.add_argument(
         "--batch-size",
         type=int,
-        default=None,
-        help="Rows per committed insert batch. Defaults to 1000, or 50000 with --fast.",
+        default=DEFAULT_BATCH_SIZE,
+        help=f"Rows per committed insert batch. Defaults to {DEFAULT_BATCH_SIZE}.",
     )
     parser.add_argument(
         "--workers",
         type=int,
         default=None,
-        help=(
-            "Concurrent file ingest workers. Defaults to min(4, CPU count, source file count), "
-            "or min(CPU count, source file count) with --fast."
-        ),
+        help="Concurrent file ingest workers. Defaults to min(4, CPU count, source file count).",
     )
     parser.add_argument(
         "--progress-interval",
@@ -119,36 +106,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gzip-level",
         type=int,
-        default=None,
+        default=DEFAULT_GZIP_LEVEL,
         choices=range(0, 10),
         metavar="0-9",
-        help="Per-record gzip compression level for stored payloads. Defaults to 6, or 1 with --fast.",
+        help=f"Per-record gzip compression level for stored payloads. Defaults to {DEFAULT_GZIP_LEVEL}.",
     )
     parser.add_argument(
         "--synchronous-commit",
         choices=sorted(SYNCHRONOUS_COMMIT_VALUES),
         default=None,
-        help="Session synchronous_commit setting. Defaults to off with --fast, otherwise leaves Postgres default.",
+        help="Session synchronous_commit setting. Defaults to the Postgres setting.",
     )
     return parser.parse_args()
-
-
-def resolve_batch_size(requested_batch_size: int | None, fast: bool) -> int:
-    if requested_batch_size is not None:
-        return requested_batch_size
-    return FAST_BATCH_SIZE if fast else DEFAULT_BATCH_SIZE
-
-
-def resolve_gzip_level(requested_gzip_level: int | None, fast: bool) -> int:
-    if requested_gzip_level is not None:
-        return requested_gzip_level
-    return FAST_GZIP_LEVEL if fast else DEFAULT_GZIP_LEVEL
-
-
-def resolve_synchronous_commit(requested_value: str | None, fast: bool) -> str | None:
-    if requested_value is not None:
-        return requested_value
-    return "off" if fast else None
 
 
 def set_session_options(conn: psycopg.Connection, synchronous_commit: str | None) -> None:
@@ -371,13 +340,12 @@ def find_sources(sources_dir: Path) -> list[Path]:
     return sorted(path for path in sources_dir.glob("*.zst") if path.is_file())
 
 
-def resolve_worker_count(requested_workers: int | None, source_count: int, fast: bool) -> int:
+def resolve_worker_count(requested_workers: int | None, source_count: int) -> int:
     if requested_workers is not None:
         return min(requested_workers, source_count)
 
     cpu_count = os.cpu_count() or 1
-    default_limit = cpu_count if fast else min(4, cpu_count)
-    return max(1, min(default_limit, source_count))
+    return max(1, min(4, cpu_count, source_count))
 
 
 def add_file_stats(run_stats: RunStats, file_stats: FileStats) -> None:
@@ -421,11 +389,7 @@ def process_file_worker(
 
 def main() -> int:
     args = parse_args()
-    batch_size = resolve_batch_size(args.batch_size, args.fast)
-    gzip_level = resolve_gzip_level(args.gzip_level, args.fast)
-    synchronous_commit = resolve_synchronous_commit(args.synchronous_commit, args.fast)
-
-    if batch_size <= 0:
+    if args.batch_size <= 0:
         raise SystemExit("--batch-size must be greater than 0")
     if args.workers is not None and args.workers <= 0:
         raise SystemExit("--workers must be greater than 0")
@@ -439,7 +403,7 @@ def main() -> int:
         return 0
 
     run_stats = RunStats(files_seen=len(sources))
-    worker_count = resolve_worker_count(args.workers, len(sources), args.fast)
+    worker_count = resolve_worker_count(args.workers, len(sources))
     reporter = ProgressReporter(inline=worker_count == 1)
     started_at = time.monotonic()
 
@@ -447,15 +411,14 @@ def main() -> int:
         "Ingest starting "
         f"files={len(sources)} "
         f"workers={worker_count} "
-        f"batch_size={batch_size} "
-        f"gzip_level={gzip_level} "
-        f"synchronous_commit={synchronous_commit or 'default'} "
-        f"fast={args.fast}"
+        f"batch_size={args.batch_size} "
+        f"gzip_level={args.gzip_level} "
+        f"synchronous_commit={args.synchronous_commit or 'default'}"
     )
 
     if worker_count == 1:
         with psycopg.connect(args.database_url) as conn:
-            set_session_options(conn, synchronous_commit)
+            set_session_options(conn, args.synchronous_commit)
             ensure_database(conn)
             for file_index, path in enumerate(sources, start=1):
                 file_stats = process_file(
@@ -465,9 +428,9 @@ def main() -> int:
                     path=path,
                     file_index=file_index,
                     file_count=len(sources),
-                    batch_size=batch_size,
+                    batch_size=args.batch_size,
                     progress_interval=args.progress_interval,
-                    gzip_level=gzip_level,
+                    gzip_level=args.gzip_level,
                 )
                 add_file_stats(run_stats, file_stats)
     else:
@@ -484,10 +447,10 @@ def main() -> int:
                         path,
                         file_index,
                         len(sources),
-                        batch_size,
+                        args.batch_size,
                         args.progress_interval,
-                        gzip_level,
-                        synchronous_commit,
+                        args.gzip_level,
+                        args.synchronous_commit,
                     )
                 )
 

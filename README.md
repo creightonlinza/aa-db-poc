@@ -39,23 +39,16 @@ Useful options:
 .venv/bin/python ingest.py /path/to/jsonl-zst-files --workers 8 --batch-size 5000 --progress-interval 10000 --gzip-level 6
 ```
 
-For fastest dedicated-machine ingest, use the aggressive preset:
+For a dedicated ingest machine, set concurrency and batch size explicitly. On a machine with 700GB
+RAM, the main place that memory helps is allowing larger batches without paging:
 
 ```sh
-.venv/bin/python ingest.py /path/to/jsonl-zst-files --fast --workers 40
+.venv/bin/python ingest.py /path/to/jsonl-zst-files --workers 40 --batch-size 100000 --gzip-level 6
 ```
 
-`--fast` defaults to all detected CPU workers, `--batch-size 50000`, `--gzip-level 1`, and
-`--synchronous-commit off`. You can override any of those explicitly. On a machine with 700GB RAM,
-the main place that memory helps is allowing larger batches without paging:
-
-```sh
-.venv/bin/python ingest.py /path/to/jsonl-zst-files --fast --workers 40 --batch-size 100000
-```
-
-`--workers` controls how many `.zst` files are ingested concurrently. It defaults to
-`min(4, CPU count, source file count)`, or `min(CPU count, source file count)` with `--fast`.
-Use `--workers 1` for serial ingest, or raise it for dedicated ingest machines:
+`--workers` controls how many `.jsonl.zst` files are ingested concurrently. It defaults to
+`min(4, CPU count, source file count)`. Use `--workers 1` for serial ingest, or raise it for
+dedicated ingest machines:
 
 ```sh
 .venv/bin/python ingest.py /path/to/jsonl-zst-files --workers 40 --batch-size 5000
