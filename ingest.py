@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,6 +15,11 @@ import zstandard
 
 
 DEFAULT_DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/analysis"
+DEFAULT_BATCH_SIZE = 1000
+FAST_BATCH_SIZE = 50_000
+DEFAULT_GZIP_LEVEL = 6
+FAST_GZIP_LEVEL = 1
+SYNCHRONOUS_COMMIT_VALUES = {"on", "off", "local", "remote_write", "remote_apply"}
 
 
 @dataclass
@@ -37,8 +43,8 @@ class RunStats:
 
 
 class ProgressReporter:
-    def __init__(self) -> None:
-        self._inline = sys.stdout.isatty()
+    def __init__(self, inline: bool | None = None) -> None:
+        self._inline = sys.stdout.isatty() if inline is None else inline
         self._last_len = 0
         self._active = False
 
@@ -81,7 +87,29 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL),
         help="Postgres connection URL. Defaults to DATABASE_URL or local Docker Compose Postgres.",
     )
-    parser.add_argument("--batch-size", type=int, default=1000, help="Rows per committed insert batch.")
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help=(
+            "Use aggressive ingest defaults: all CPU workers, batch size 50000, "
+            "gzip level 1, and synchronous_commit=off."
+        ),
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Rows per committed insert batch. Defaults to 1000, or 50000 with --fast.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help=(
+            "Concurrent file ingest workers. Defaults to min(4, CPU count, source file count), "
+            "or min(CPU count, source file count) with --fast."
+        ),
+    )
     parser.add_argument(
         "--progress-interval",
         type=int,
@@ -91,15 +119,49 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gzip-level",
         type=int,
-        default=6,
-        choices=range(1, 10),
-        metavar="1-9",
-        help="Per-record gzip compression level for stored payloads.",
+        default=None,
+        choices=range(0, 10),
+        metavar="0-9",
+        help="Per-record gzip compression level for stored payloads. Defaults to 6, or 1 with --fast.",
+    )
+    parser.add_argument(
+        "--synchronous-commit",
+        choices=sorted(SYNCHRONOUS_COMMIT_VALUES),
+        default=None,
+        help="Session synchronous_commit setting. Defaults to off with --fast, otherwise leaves Postgres default.",
     )
     return parser.parse_args()
 
 
-def ensure_database(conn: psycopg.Connection) -> None:
+def resolve_batch_size(requested_batch_size: int | None, fast: bool) -> int:
+    if requested_batch_size is not None:
+        return requested_batch_size
+    return FAST_BATCH_SIZE if fast else DEFAULT_BATCH_SIZE
+
+
+def resolve_gzip_level(requested_gzip_level: int | None, fast: bool) -> int:
+    if requested_gzip_level is not None:
+        return requested_gzip_level
+    return FAST_GZIP_LEVEL if fast else DEFAULT_GZIP_LEVEL
+
+
+def resolve_synchronous_commit(requested_value: str | None, fast: bool) -> str | None:
+    if requested_value is not None:
+        return requested_value
+    return "off" if fast else None
+
+
+def set_session_options(conn: psycopg.Connection, synchronous_commit: str | None) -> None:
+    if synchronous_commit is None:
+        return
+    if synchronous_commit not in SYNCHRONOUS_COMMIT_VALUES:
+        raise ValueError(f"Unsupported synchronous_commit value: {synchronous_commit}")
+    with conn.cursor() as cur:
+        cur.execute(f"SET synchronous_commit TO {synchronous_commit}")
+    conn.commit()
+
+
+def ensure_records_table(conn: psycopg.Connection) -> None:
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -109,6 +171,11 @@ def ensure_database(conn: psycopg.Connection) -> None:
             )
             """
         )
+    conn.commit()
+
+
+def ensure_ingest_batch_table(conn: psycopg.Connection) -> None:
+    with conn.cursor() as cur:
         cur.execute(
             """
             CREATE TEMP TABLE IF NOT EXISTS ingest_batch (
@@ -118,6 +185,11 @@ def ensure_database(conn: psycopg.Connection) -> None:
             """
         )
     conn.commit()
+
+
+def ensure_database(conn: psycopg.Connection) -> None:
+    ensure_records_table(conn)
+    ensure_ingest_batch_table(conn)
 
 
 def load_batch(conn: psycopg.Connection, batch: list[tuple[str, bytes]]) -> tuple[int, int]:
@@ -161,6 +233,7 @@ def extract_track_id(record: object) -> str | None:
 
 def print_progress(
     reporter: ProgressReporter,
+    worker_id: int | None,
     file_index: int,
     file_count: int,
     path: Path,
@@ -170,8 +243,10 @@ def print_progress(
 ) -> None:
     elapsed = max(time.monotonic() - started_at, 0.001)
     rate = stats.lines_seen / elapsed
+    worker = f"worker={worker_id} " if worker_id is not None else ""
     reporter.progress(
         "Progress "
+        f"{worker}"
         f"file={file_index}/{file_count} "
         f"path={path} "
         f"line={stats.lines_seen} "
@@ -212,32 +287,30 @@ def flush_batch(
     conn: psycopg.Connection,
     batch: list[tuple[str, bytes]],
     file_stats: FileStats,
-    run_stats: RunStats,
 ) -> None:
     inserted, duplicates = load_batch(conn, batch)
     file_stats.inserted += inserted
     file_stats.duplicates += duplicates
-    run_stats.inserted += inserted
-    run_stats.duplicates += duplicates
     batch.clear()
 
 
 def process_file(
     reporter: ProgressReporter,
     conn: psycopg.Connection,
+    worker_id: int | None,
     path: Path,
     file_index: int,
     file_count: int,
     batch_size: int,
     progress_interval: int,
     gzip_level: int,
-    run_stats: RunStats,
 ) -> FileStats:
     file_stats = FileStats()
     batch: list[tuple[str, bytes]] = []
     started_at = time.monotonic()
 
-    reporter.line(f"Processing file {file_index}/{file_count}: {path}")
+    worker = f" worker={worker_id}" if worker_id is not None else ""
+    reporter.line(f"Processing file={file_index}/{file_count}{worker} path={path}")
 
     try:
         with path.open("rb") as compressed:
@@ -250,21 +323,20 @@ def process_file(
                         break
 
                     file_stats.lines_seen += 1
-                    run_stats.lines_seen += 1
                     processed = process_record(reporter, path, file_stats.lines_seen, line, gzip_level)
 
                     if processed is None:
                         file_stats.bad_records += 1
-                        run_stats.bad_records += 1
                     else:
                         batch.append(processed)
 
                     if len(batch) >= batch_size:
-                        flush_batch(conn, batch, file_stats, run_stats)
+                        flush_batch(conn, batch, file_stats)
 
                     if progress_interval and file_stats.lines_seen % progress_interval == 0:
                         print_progress(
                             reporter,
+                            worker_id,
                             file_index,
                             file_count,
                             path,
@@ -274,15 +346,15 @@ def process_file(
                         )
     except zstandard.ZstdError as exc:
         file_stats.errors += 1
-        run_stats.errors += 1
         reporter.error(f"Zstandard error path={path} after_line={file_stats.lines_seen}: {exc}")
 
     if batch:
-        flush_batch(conn, batch, file_stats, run_stats)
+        flush_batch(conn, batch, file_stats)
 
     elapsed = max(time.monotonic() - started_at, 0.001)
     reporter.line(
         "Finished "
+        f"{f'worker={worker_id} ' if worker_id is not None else ''}"
         f"file={file_index}/{file_count} "
         f"path={path} "
         f"lines={file_stats.lines_seen} "
@@ -299,10 +371,64 @@ def find_sources(sources_dir: Path) -> list[Path]:
     return sorted(path for path in sources_dir.glob("*.jsonl.zst") if path.is_file())
 
 
+def resolve_worker_count(requested_workers: int | None, source_count: int, fast: bool) -> int:
+    if requested_workers is not None:
+        return min(requested_workers, source_count)
+
+    cpu_count = os.cpu_count() or 1
+    default_limit = cpu_count if fast else min(4, cpu_count)
+    return max(1, min(default_limit, source_count))
+
+
+def add_file_stats(run_stats: RunStats, file_stats: FileStats) -> None:
+    run_stats.lines_seen += file_stats.lines_seen
+    run_stats.inserted += file_stats.inserted
+    run_stats.duplicates += file_stats.duplicates
+    run_stats.bad_records += file_stats.bad_records
+    run_stats.errors += file_stats.errors
+    if file_stats.errors:
+        run_stats.files_with_errors += 1
+
+
+def process_file_worker(
+    database_url: str,
+    path: Path,
+    file_index: int,
+    file_count: int,
+    batch_size: int,
+    progress_interval: int,
+    gzip_level: int,
+    synchronous_commit: str | None,
+) -> tuple[int, FileStats]:
+    reporter = ProgressReporter(inline=False)
+    worker_id = os.getpid()
+    with psycopg.connect(database_url) as conn:
+        set_session_options(conn, synchronous_commit)
+        ensure_ingest_batch_table(conn)
+        file_stats = process_file(
+            reporter=reporter,
+            conn=conn,
+            worker_id=worker_id,
+            path=path,
+            file_index=file_index,
+            file_count=file_count,
+            batch_size=batch_size,
+            progress_interval=progress_interval,
+            gzip_level=gzip_level,
+        )
+    return file_index, file_stats
+
+
 def main() -> int:
     args = parse_args()
-    if args.batch_size <= 0:
+    batch_size = resolve_batch_size(args.batch_size, args.fast)
+    gzip_level = resolve_gzip_level(args.gzip_level, args.fast)
+    synchronous_commit = resolve_synchronous_commit(args.synchronous_commit, args.fast)
+
+    if batch_size <= 0:
         raise SystemExit("--batch-size must be greater than 0")
+    if args.workers is not None and args.workers <= 0:
+        raise SystemExit("--workers must be greater than 0")
     if args.progress_interval < 0:
         raise SystemExit("--progress-interval must be 0 or greater")
 
@@ -313,25 +439,61 @@ def main() -> int:
         return 0
 
     run_stats = RunStats(files_seen=len(sources))
-    reporter = ProgressReporter()
+    worker_count = resolve_worker_count(args.workers, len(sources), args.fast)
+    reporter = ProgressReporter(inline=worker_count == 1)
     started_at = time.monotonic()
 
-    with psycopg.connect(args.database_url) as conn:
-        ensure_database(conn)
-        for file_index, path in enumerate(sources, start=1):
-            file_stats = process_file(
-                reporter=reporter,
-                conn=conn,
-                path=path,
-                file_index=file_index,
-                file_count=len(sources),
-                batch_size=args.batch_size,
-                progress_interval=args.progress_interval,
-                gzip_level=args.gzip_level,
-                run_stats=run_stats,
-            )
-            if file_stats.errors:
-                run_stats.files_with_errors += 1
+    reporter.line(
+        "Ingest starting "
+        f"files={len(sources)} "
+        f"workers={worker_count} "
+        f"batch_size={batch_size} "
+        f"gzip_level={gzip_level} "
+        f"synchronous_commit={synchronous_commit or 'default'} "
+        f"fast={args.fast}"
+    )
+
+    if worker_count == 1:
+        with psycopg.connect(args.database_url) as conn:
+            set_session_options(conn, synchronous_commit)
+            ensure_database(conn)
+            for file_index, path in enumerate(sources, start=1):
+                file_stats = process_file(
+                    reporter=reporter,
+                    conn=conn,
+                    worker_id=None,
+                    path=path,
+                    file_index=file_index,
+                    file_count=len(sources),
+                    batch_size=batch_size,
+                    progress_interval=args.progress_interval,
+                    gzip_level=gzip_level,
+                )
+                add_file_stats(run_stats, file_stats)
+    else:
+        with psycopg.connect(args.database_url) as conn:
+            ensure_records_table(conn)
+
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            futures = []
+            for file_index, path in enumerate(sources, start=1):
+                futures.append(
+                    executor.submit(
+                        process_file_worker,
+                        args.database_url,
+                        path,
+                        file_index,
+                        len(sources),
+                        batch_size,
+                        args.progress_interval,
+                        gzip_level,
+                        synchronous_commit,
+                    )
+                )
+
+            for future in as_completed(futures):
+                _file_index, file_stats = future.result()
+                add_file_stats(run_stats, file_stats)
 
     elapsed = max(time.monotonic() - started_at, 0.001)
     reporter.line(

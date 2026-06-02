@@ -36,8 +36,39 @@ Override it with `DATABASE_URL` or `--database-url`.
 Useful options:
 
 ```sh
-.venv/bin/python ingest.py /path/to/jsonl-zst-files --batch-size 5000 --progress-interval 10000 --gzip-level 6
+.venv/bin/python ingest.py /path/to/jsonl-zst-files --workers 8 --batch-size 5000 --progress-interval 10000 --gzip-level 6
 ```
+
+For fastest dedicated-machine ingest, use the aggressive preset:
+
+```sh
+.venv/bin/python ingest.py /path/to/jsonl-zst-files --fast --workers 40
+```
+
+`--fast` defaults to all detected CPU workers, `--batch-size 50000`, `--gzip-level 1`, and
+`--synchronous-commit off`. You can override any of those explicitly. On a machine with 700GB RAM,
+the main place that memory helps is allowing larger batches without paging:
+
+```sh
+.venv/bin/python ingest.py /path/to/jsonl-zst-files --fast --workers 40 --batch-size 100000
+```
+
+`--workers` controls how many `.jsonl.zst` files are ingested concurrently. It defaults to
+`min(4, CPU count, source file count)`, or `min(CPU count, source file count)` with `--fast`.
+Use `--workers 1` for serial ingest, or raise it for dedicated ingest machines:
+
+```sh
+.venv/bin/python ingest.py /path/to/jsonl-zst-files --workers 40 --batch-size 5000
+```
+
+Each worker uses its own Postgres connection and streams one file at a time, so memory stays bounded
+by roughly `workers * batch-size * average gzipped payload size`. On the Docker Compose Postgres
+setup, disk and WAL throughput may become the bottleneck before CPU or RAM are exhausted; start with
+`--workers 8` and scale up while watching database throughput.
+
+`--synchronous-commit off` can improve commit throughput during ingest, but recently committed rows
+can be lost if Postgres or the host crashes before WAL is flushed. The table remains consistent, and
+rerunning ingest will skip already-present IDs.
 
 ## Table
 
