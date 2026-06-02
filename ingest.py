@@ -79,9 +79,9 @@ class ProgressReporter:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Stream .jsonl.zst analysis records into a lean Postgres lookup table."
+        description="Stream .zst-compressed JSONL analysis records into a lean Postgres lookup table."
     )
-    parser.add_argument("input_path", help="Directory containing .jsonl.zst files to ingest.")
+    parser.add_argument("input_path", help="Directory containing .zst files to ingest.")
     parser.add_argument(
         "--database-url",
         default=os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL),
@@ -368,7 +368,7 @@ def process_file(
 
 
 def find_sources(sources_dir: Path) -> list[Path]:
-    return sorted(path for path in sources_dir.glob("*.jsonl.zst") if path.is_file())
+    return sorted(path for path in sources_dir.glob("*.zst") if path.is_file())
 
 
 def resolve_worker_count(requested_workers: int | None, source_count: int, fast: bool) -> int:
@@ -435,7 +435,7 @@ def main() -> int:
     sources_dir = Path(args.input_path)
     sources = find_sources(sources_dir)
     if not sources:
-        print(f"No .jsonl.zst files found in {sources_dir}", flush=True)
+        print(f"No .zst files found in {sources_dir}", flush=True)
         return 0
 
     run_stats = RunStats(files_seen=len(sources))

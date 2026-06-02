@@ -1,6 +1,6 @@
 # Analysis Record Lookup POC
 
-This POC streams `.jsonl.zst` files from a user-supplied directory, extracts each record ID from `meta.track_id`, stores the original JSON line as gzipped bytes in Postgres, and serves records by ID through a small FastAPI app.
+This POC streams `.zst` files containing JSONL records from a user-supplied directory, extracts each record ID from `meta.track_id`, stores the original JSON line as gzipped bytes in Postgres, and serves records by ID through a small FastAPI app.
 
 The source files are never modified and decompressed data is never written to disk.
 
@@ -53,7 +53,7 @@ the main place that memory helps is allowing larger batches without paging:
 .venv/bin/python ingest.py /path/to/jsonl-zst-files --fast --workers 40 --batch-size 100000
 ```
 
-`--workers` controls how many `.jsonl.zst` files are ingested concurrently. It defaults to
+`--workers` controls how many `.zst` files are ingested concurrently. It defaults to
 `min(4, CPU count, source file count)`, or `min(CPU count, source file count)` with `--fast`.
 Use `--workers 1` for serial ingest, or raise it for dedicated ingest machines:
 
